@@ -4,28 +4,85 @@ import mpi.*;
 import org.example.Location;
 import org.example.Location2;
 import org.example.Utils;
+import com.google.gson.Gson;
 import java.io.*;
 import java.util.*;
-import java.io.FileWriter;
-import com.google.gson.Gson;
 
 public class distributed {
 
     public static void main(String[] args) throws Exception {
         MPI.Init(args);
         int rank = MPI.COMM_WORLD.Rank();
+
+        boolean testing = false;
+        int whichTest = 0;
+
+        for (int i = 0; i < args.length; i++) {
+            if (args[i].equals("--test")) {
+                testing = true;
+            }
+            if (args[i].equals("1") || args[i].equals("2")) {
+                whichTest = Integer.parseInt(args[i]);
+            }
+        }
+
+        if (testing) {
+            while (true) {
+                boolean[] testingStop = new boolean[1];
+                int[] parameters = new int[3];
+                if (rank == 0) {
+                    testingStop[0] = Test.shouldRunTest(whichTest);
+                    if (testingStop[0]) {
+                        parameters[0] = Test.getNumClusters(whichTest);
+                        parameters[1] = 1000;
+                        parameters[2] = Test.getAccumulationSites(whichTest);
+                    }
+                }
+
+                MPI.COMM_WORLD.Bcast(testingStop, 0, 1, MPI.BOOLEAN, 0);
+                if (!testingStop[0]) {
+                    break;
+                }
+
+                MPI.COMM_WORLD.Bcast(parameters, 0, 3, MPI.INT, 0);
+                distributedkmeans(parameters[0], parameters[1], parameters[2], testing);
+
+                if (rank == 0) {
+                    Test.results(whichTest);
+                }
+            }
+
+            MPI.Finalize();
+            return;
+        }
+
+        //ne radi 0 i 1
+        int numClusters = Integer.parseInt(args[args.length - 2]);
+        int accumulationSites = Integer.parseInt(args[args.length - 1]);
+
+        //i limited max cycles to 200, project description said it
+        distributedkmeans(numClusters, 200, accumulationSites, false);
+
+        MPI.Finalize();
+    }
+
+    public static void distributedkmeans(int numClusters, int maxCycles, int accumulationSites, boolean testing) throws Exception {
+        int rank = MPI.COMM_WORLD.Rank();
         int size = MPI.COMM_WORLD.Size();
 
-        //0 and 1 x
-        int numClusters = Integer.parseInt(args[args.length - 2]);
-        int maxCycles = Integer.parseInt(args[args.length - 1]);
-
+        if (rank == 0 && testing) {
+            DistributedTimer.startTime = System.nanoTime();
+        }
         Location2[] allLocations = null;
         Location[] locations = null;
 
         if (rank == 0) {
             allLocations = Utils.gson();
-            //once again because of colors
+            if (accumulationSites > allLocations.length) {
+                allLocations = Utils.additionalLocations(allLocations, accumulationSites);
+            } else {
+                allLocations = Arrays.copyOf(allLocations, accumulationSites);
+            }
             locations = Utils.convertToLocation(allLocations);
         }
 
@@ -36,12 +93,12 @@ public class distributed {
             totalPoints = 0;
         }
 
-        int[] items = new int[size]; //items per process
+        int[] items = new int[size];
         int[] start = new int[size];
 
         if (rank == 0) {
             int numItems = totalPoints / size;
-            int remainder = totalPoints % size; //leftover stuff
+            int remainder = totalPoints % size;
             int offset = 0;
 
             for (int i = 0; i < size; i++) {
@@ -62,10 +119,7 @@ public class distributed {
 
         Object[] send = null;
         if (rank == 0) {
-            send = new Object[locations.length];
-            for (int i = 0; i < locations.length; i++) {
-                send[i] = locations[i];
-            }
+            send = Arrays.copyOf(locations, locations.length, Object[].class);
         }
         Object[] receive = new Object[localItems[0]];
 
@@ -74,7 +128,6 @@ public class distributed {
             localPoints[i] = (Location) receive[i];
         }
 
-        //random centroids
         Location[] centroids = new Location[numClusters];
         Random rnd = new Random();
 
@@ -88,11 +141,6 @@ public class distributed {
 
         MPI.COMM_WORLD.Bcast(centroids, 0, numClusters, MPI.OBJECT, 0);
 
-
-
-        int cycles = 0;
-        boolean changed = true;
-
         int[] labels = new int[localPoints.length];
         double[] sumLat = new double[numClusters];
         double[] sumLon = new double[numClusters];
@@ -103,7 +151,8 @@ public class distributed {
             startTime = System.nanoTime();
         }
 
-
+        int cycles = 0;
+        boolean changed = true;
         while (changed && cycles < maxCycles) {
             boolean localChanged = false;
             Arrays.fill(sumLat, 0);
@@ -176,23 +225,114 @@ public class distributed {
             long duration = endTime - startTime;
             double seconds = duration / 1_000_000_000.0;
             System.out.println("Total computation time: " + seconds + " seconds");
-        }
 
+            if (!testing) {
+                System.out.println("Distributed cycles: " + cycles);
+                for (int c = 0; c < numClusters; c++) {
+                    System.out.println("Centroid " + c + ": (" + centroids[c].la + ", " + centroids[c].lo + ")");
+                }
 
-        if (rank == 0) {
-            System.out.println("Distributed cycles: " + cycles);
-            for (int c = 0; c < numClusters; c++) {
-                System.out.println("Centroid " + c + ": (" + centroids[c].la + ", " + centroids[c].lo + ")");
+                try (FileWriter writer = new FileWriter("centroids.json")) {
+                    Gson gson = new Gson();
+                    gson.toJson(centroids, writer);
+                    System.out.println("saved to centroids.json");
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+
+                try (FileWriter writer = new FileWriter("locations.json")) {
+                    Gson gson = new Gson();
+                    for (Location loc : locations) {
+                        int best = -1;
+                        double minDist = Double.MAX_VALUE;
+                        for (int c = 0; c < numClusters; c++) {
+                            double d = Utils.distance(loc, centroids[c]);
+                            if (d < minDist) {
+                                minDist = d;
+                                best = c;
+                            }
+                        }
+                        loc.color = centroids[best].color;
+                    }
+                    gson.toJson(locations, writer);
+                    System.out.println("saved to locations.json");
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             }
-
-            try (FileWriter writer = new FileWriter("centroids.json")) {
-                Gson gson = new Gson();
-                gson.toJson(centroids, writer);
-                System.out.println("saved to centroids.json");
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
         }
-        MPI.Finalize();
     }
+
+
+}
+
+
+
+class Test {
+    private static int currentSites = 500;
+    private static int currentClusters = 5;
+    private static final int addSites = 500;
+    private static final int addClusters = 5;
+    private static final int maxSites = 300000;
+    private static final int sitesTest2 = 30000;
+    private static final int runs = 3;
+    private static int currentRun = 0;
+    private static long totalTime = 0;
+
+    public static boolean shouldRunTest(int testModeType) {
+        if (testModeType == 1 && currentSites > maxSites) {
+            return false;
+        }
+        if (testModeType == 2 && currentClusters > sitesTest2 / 3) {
+            return false;
+        }
+        return true;
+    }
+
+    public static int getNumClusters(int testMode) {
+        if (testMode == 1) {
+            return 20;
+        } else {
+            return currentClusters;
+        }
+    }
+
+    public static int getAccumulationSites(int testMode) {
+        if (testMode == 1) {
+            return currentSites;
+        } else {
+            return sitesTest2;
+        }
+    }
+
+    public static void results(int testModeType) {
+        currentRun++;
+        long duration = System.nanoTime() - DistributedTimer.startTime;
+        totalTime += duration / 1_000_000;
+
+        if (currentRun == runs) {
+            long avgTime = totalTime / runs;
+            if (testModeType == 1) {
+                System.out.println(currentSites + "|" + 20 + "|" + avgTime);
+                if (avgTime > 120000) {
+                    currentSites = maxSites + 1;
+                } else {
+                    currentSites = currentSites + addSites;
+                }
+            } else {
+                System.out.println(sitesTest2 + "|" + currentClusters + "|" + avgTime);
+                if (avgTime > 120000) {
+                    currentClusters = (sitesTest2 / 3) + 1;
+                } else {
+                    currentClusters = currentClusters + addClusters;
+                }
+            }
+            currentRun = 0;
+            totalTime = 0;
+        }
+    }
+}
+
+class DistributedTimer {
+    public static long startTime = 0;
 }
